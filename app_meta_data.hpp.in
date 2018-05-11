@@ -1,0 +1,7 @@
+#ifndef APP_META_DATA_H
+#define APP_META_DATA_H
+
+#define APP_VERSION "@PROJECT_VERSION@"
+#define APP_NAME "@PROJECT_NAME@"
+
+#endif
