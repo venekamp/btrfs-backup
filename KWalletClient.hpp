@@ -15,18 +15,16 @@ class KWalletClient : public QApplication {
     Q_OBJECT
 
     public:
-        enum Command {
-            NO_COMMAND,
-            SetCredentials,
-            GetCredentials,
-            SetPassword,
-            GetPassword
+        enum Mode {
+            NO_MODE,
+            Set,
+            Get
         };
 
         KWalletClient(int &, char**);
 
-        void setCommand(Command command) {
-            this->command = command;
+        void setCommand(Mode mode) {
+            this->mode = mode;
         }
 
         void setWalletName(const QString &walletName) {
@@ -41,7 +39,7 @@ class KWalletClient : public QApplication {
         bool verbose;
         QString walletName;
         QString folderName;
-        Command command;
+        Mode mode;
         Wallet *wallet;
 
         void timerEvent(QTimerEvent *) override;

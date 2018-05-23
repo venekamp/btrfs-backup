@@ -8,7 +8,7 @@
 KWalletClient::KWalletClient(int &argc, char *argv[]) :
     QApplication(argc, argv),
     verbose(true),
-    command(NO_COMMAND),
+    mode(NO_MODE),
     wallet(nullptr)
 {
     QTimerEvent *timerEvent = new QTimerEvent(100);
@@ -40,19 +40,14 @@ void KWalletClient::walletOpened(bool success)
         exit(1);
     }
 
-    switch(command) {
-        case GetCredentials:
-            getCredentials();
+    wallet = Wallet::openWallet(walletName, 0);
+
+    switch(mode) {
+        case Get:
             break;
-        case SetCredentials:
-            setCredentials();
+        case Set:
             break;
-        case GetPassword:
-            getPassword();
-            break;
-        case SetPassword:
-            setPassword();
-            break;
+        case NO_MODE:
         default:
             std::cout << "Unknown method encounterd. Aborting." << std::endl;
             exit(1);
@@ -63,16 +58,12 @@ void KWalletClient::getCredentials(void)
 {
     std::cout << "Getting credentials." << std::endl;
 
-    wallet = Wallet::openWallet(walletName, 0);
-
     quit();
 }
 
 void KWalletClient::setCredentials(void)
 {
     std::cout << "Setting credentials." << std::endl;
-
-    wallet = Wallet::openWallet(walletName, 0);
 
     quit();
 }
@@ -81,7 +72,10 @@ void KWalletClient::getPassword(void)
 {
     std::cout << "Getting password." << std::endl;
 
-    wallet = Wallet::openWallet(walletName, 0);
+    if (!wallet->setFolder(folderName)) {
+        std::cout << i18n("The folder %1 could not be found.", folderName).toUtf8().constData() << std::endl;
+        exit(1);
+    }
 
     quit();
 }
@@ -89,8 +83,6 @@ void KWalletClient::getPassword(void)
 void KWalletClient::setPassword(void)
 {
     std::cout << "Setting password." << std::endl;
-
-    wallet = Wallet::openWallet(walletName, 0);
 
     quit();
 }

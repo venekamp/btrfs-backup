@@ -8,18 +8,15 @@
 
 
 int parseCommandLine(KWalletClient &app, QCommandLineParser &parser) {
-    QCommandLineOption setSMBCredentials(QStringLiteral("set-credentials"), i18n("Set the user credentials for accessing the SMB share."));
-    QCommandLineOption getSMBCredentials(QStringLiteral("get-credentials"), i18n("Get the user credentials for accessing the SMB share."));
-    QCommandLineOption setEncryptionPassword(QStringLiteral("set-password"), i18n("Set the password for accessing the encrypted backup disk."));
-    QCommandLineOption getEncryptionPassword(QStringLiteral("get-password"), i18n("Get the password for accessing the encrypted backup disk."));
+    QCommandLineOption setMode(QStringLiteral("set"), i18n("Set <entry> in <folder> of <wallet>. Values are read from standard input."));
+    QCommandLineOption getMode(QStringLiteral("get"), i18n("Get key or key values pairs from <entry>."));
 
     parser.addPositionalArgument(QStringLiteral("wallet"), i18n("Wallet to query."));
     parser.addPositionalArgument(QStringLiteral("folder"), i18n("Folder to use."));
+    parser.addPositionalArgument(QStringLiteral("entry"), i18n("Entry to use."));
 
-    parser.addOption(getSMBCredentials);
-    parser.addOption(setSMBCredentials);
-    parser.addOption(getEncryptionPassword);
-    parser.addOption(setEncryptionPassword);
+    parser.addOption(getMode);
+    parser.addOption(setMode);
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -31,19 +28,8 @@ int parseCommandLine(KWalletClient &app, QCommandLineParser &parser) {
         app.setWalletName(args[0]);
         app.setFolderName(args[1]);
 
-        if (parser.isSet(setSMBCredentials)) {
-            app.setCommand(KWalletClient::SetCredentials);
-        }
-
-        if (parser.isSet(setEncryptionPassword)) {
-            app.setCommand(KWalletClient::SetPassword);
-        }
-
-        if (parser.isSet(getSMBCredentials)) {
-            app.setCommand(KWalletClient::GetCredentials);
-        } else if (parser.isSet(getEncryptionPassword)) {
-            app.setCommand(KWalletClient::GetPassword);
-        }
+        if (parser.isSet(setMode)) app.setCommand(KWalletClient::Set);
+        if (parser.isSet(getMode)) app.setCommand(KWalletClient::Get);
 
         return app.exec();
     }
