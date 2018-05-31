@@ -1,0 +1,396 @@
+#!/bin/bash
+
+
+BACKUP_ROOT=/home/.backup-laptop
+BACKUP_DISK=$BACKUP_ROOT/backup-disk
+BACKUP_SMB=$BACKUP_ROOT/surfsara-disk
+BACKUP_IMAGE=$BACKUP_SMB/backup-disk-image.btrfs
+
+SNAPSHOT_SRC_FOLDER=/home/.snapshots
+SNAPSHOT_DEST_FOLDER=$BACKUP_DISK/snapshots
+
+MAPPER_NAME=backup-surfsara
+
+
+CreateTopLevelBackupDirs() {
+    [[ -v verbose ]] && echo "Checking for necessary directories,"
+    if [[ ! $(btrfs subvolume show $BACKUP_ROOT  2>/dev/null) ]]; then
+        if [[ -e $BACKUP_ROOT ]]; then
+            echo -n "$BACKUP_ROOT already exists. Okay to delete it? (y/N) "
+
+            local ans
+            read ans
+            echo
+
+            case "$ans" in
+                y | Y | yes | YES)
+                    rm -rf $BACKUP_ROOT
+
+                    btrfs subvolume create $BACKUP_ROOT
+                    [[ -v verbose ]] && echo "BTRFS volume created at: $BACKUP_ROOT"
+                    ;;
+            esac
+        fi
+    fi
+
+    if [[ ! -e $BACKUP_SMB ]]; then
+        mkdir $BACKUP_SMB
+        [[ -v verbose ]] && echo "Created $BACKUP_SMB."
+    fi
+
+    if [[ ! -e $BACKUP_DISK ]]; then
+        mkdir $BACKUP_DISK
+        [[ -v verbose ]] && echo "Created $BACKUP_DISK."
+    fi
+}
+
+
+CreateLogicalVolume() {
+    local loop_device
+
+    loop_device=$1
+
+    [[ -v verbose ]] && echo "Opening luks device: $MAPPER_NAME"
+    echo -n "$PASSWD" | base64 -d | cryptsetup open --key-file - $loop_device $MAPPER_NAME
+}
+
+
+CreateBackupDisk() {
+    local loop_device
+
+    if [[ $# != 1 ]]; then
+        echo "Expecting one argument <user_name>."
+        exit 1
+    fi
+
+    user_name="$1"
+
+    [[ -v verbose ]] && echo "Creating backup disk for user: $user_name"
+    CreateTopLevelBackupDirs
+
+    if [[ ! -f $BACKUP_IMAGE ]]; then
+        echo "Backup image $BACKUP_IMAGE was not found. Aborting."
+        exit 1
+    fi
+
+    [[ -v verbose ]] && echo "Setting up loop device: ${BACKUP_IMAGE##*/}"
+    loop_device=$(losetup --show --find "$BACKUP_IMAGE")
+    [[ -v verbose ]] && echo "Created loop device for image on: $loop_device."
+
+    [[ -v verbose ]] && echo "Formatting luks device. "
+    echo -n "$PASSWD" | base64 -d | cryptsetup --cipher aes-xts-plain64 --key-size 512 --type luks2 luksFormat $loop_device -
+
+    # [[ -v verbose ]] && echo -n "Adding key... "
+    # echo -n "$PASSWD" | base64 -d | cryptsetup luksAddKey --key-slot 0 --key-file - $loop_device
+    # echo "Done"
+
+    CreateLogicalVolume $loop_device
+
+    [[ -v verbose ]] && echo "Creating BTRFS file system. "
+    mkfs.btrfs -f --nodesize 65536 --label "SURFsara backup ($user_name)" /dev/mapper/$MAPPER_NAME >/dev/null
+
+    [[ -v verbose ]] && echo "Wait 5 seconds for mkfs to finish. "
+    sleep 5
+
+    [[ -v verbose ]] && echo "Close luks device $MAPPER_NAME. "
+    cryptsetup close $MAPPER_NAME
+
+    [[ -v verbose ]] && echo "Deleting loop device $loop_device. "
+    losetup -d $loop_device
+}
+
+
+MountSambaShare() {
+    local user_name
+
+    if [[ $# -ne 1 ]]; then
+        echo "Error: $0 expects one argument <user_name>."
+        exit 1
+    fi
+
+    user_name="$1"
+
+    if [[ $(mount -t cifs | awk '{ print $3 '}) == "/home/.backup-laptop/surfsara-disk" ]]; then
+        echo "Already mounted."
+        return 0
+    fi
+
+    mount -t cifs //fs1.ia.surfsara.nl/backup_$user -osec=ntlmv2,domain=KA,username=$user,uid=1000,gid=0 /home/.backup-laptop/surfsara-disk
+}
+
+
+MountBackupDisk() {
+    local loop_device
+
+    if $(losetup -l | grep "$BACKUP_IMAGE" >/dev/null ); then
+        echo "Loop device already set up."
+
+        return
+    fi
+
+    loop_device=$(losetup --show --find "$BACKUP_IMAGE")
+    [[ -v verbose ]] && echo "Created loop device: $loop_device"
+
+    CreateLogicalVolume $loop_device
+
+    [[ -v verbose ]] && echo "Mounting backup disk."
+    mount -t btrfs "/dev/mapper/$MAPPER_NAME" "$BACKUP_DISK"
+}
+
+
+UnmountBackupDisk() {
+    local loop_device
+
+    if mount | grep "$BACKUP_DISK" >/dev/null; then
+        [[ -v verbose ]] && echo "umount $BACKUP_DISK"
+        umount "$BACKUP_DISK"
+    fi
+
+    if cryptsetup status backup-surfsara | head -1 | grep active >/dev/null; then
+        [[ -v verbose ]] && echo "close luks device: $MAPPER_NAME"
+        cryptsetup close "$MAPPER_NAME"
+    fi
+
+    loop_device=$(losetup -l | grep "$BACKUP_IMAGE" | awk '{ print $1 }')
+    if [[ $loop_device =~ /dev/loop[0-9]+ ]]; then
+        [[ -v verbose ]] && echo "close loop device: $loop_device"
+        losetup -d $loop_device
+    fi
+}
+
+
+GetSubvolumeSize() {
+    local snapshot_number
+    local snapshot_parent_number
+    local current_snapshot
+    local parent_snapshot
+    local size
+
+    [[ -v verbose ]] && echo "Determine snapshot size. This will take a while."
+
+    if [[ $# -lt 1 ]]; then
+        echo "Expecting at least one snapshot number as argument."
+        exit -1
+    fi
+
+    snapshot_number=$1
+    if [[ $# -eq 2 ]]; then
+        snapshot_parent_number=$2
+    fi
+
+    current_snapshot="$SNAPSHOT_SRC_FOLDER/$snapshot_number/snapshot"
+    parent_snapshot="$SNAPSHOT_SRC_FOLDER/$snapshot_parent_number/snapshot"
+
+    if [[ -v snapshot_parent_number ]]; then
+        [[ -v verbose ]] && echo "Calculating incremental size."
+        size=$(btrfs send -p $parent_snapshot $current_snapshot | pv -F "%t %a %r %b" | dd of=/dev/null |& tail -1 | awk '{ print $1 '})
+    else
+        [[ -v verbose ]] && echo "Calculating full snapshot size. Oh Yeah, this can really take some time..."
+        size=$(btrfs send $current_snapshot | pv -F "%t %a %r %b" | dd of=/dev/null |& tail -1 | awk '{ print $1 '})
+    fi
+
+    total_transfer_size=$size   # Global vatiable
+}
+
+
+TransferAll() {
+    local current_snapshot
+    local parent_snapshot
+
+    for i in $(ls $SNAPSHOT_SRC_FOLDER | sort -g); do
+        current_snapshot=$i
+        if [[ -e "$SNAPSHOT_SRC_FOLDER/$current_snapshot" ]]; then
+            Transfer $current_snapshot $parent_snapshot
+        fi
+        parent_snapshot=$current_snapshot
+    done
+}
+
+
+Transfer() {
+    local total_transfer_size
+    local snapshot_number
+    local snapshot_parent_number
+    local snapshot_send
+    local snapshot_receive
+    local snapshot_parent
+
+    snapshot_number=$1;
+    snapshot_metadata="$SNAPSHOT_SRC_FOLDER/$snapshot_number/info.xml"
+    snapshot_send="$SNAPSHOT_SRC_FOLDER/$snapshot_number/snapshot"
+    snapshot_receive="$SNAPSHOT_DEST_FOLDER/$snapshot_number"
+
+    if [[ $# -gt 1 ]]; then
+        snapshot_parent_number=$2
+        snapshot_parent="$SNAPSHOT_SRC_FOLDER/$2/snapshot"
+    fi
+
+    if [[ ! -e "$SNAPSHOT_DEST_FOLDER" ]]; then
+        [[ -v verbose ]] && echo "Creating top snapshot folder: $SNAPSHOT_DEST_FOLDER"
+        mkdir "$SNAPSHOT_DEST_FOLDER"
+    fi
+
+    GetSubvolumeSize $snapshot_number $snapshot_parent_number   # Results is stored in global total_transfer_size variable.
+    echo "Transfer will take $(numfmt --to=iec $total_transfer_size)."
+
+    [[ -v verbose ]] && echo "Creating snapshot folder: $snapshot_receive"
+    mkdir "$snapshot_receive"
+
+    [[ -v verbose ]] && echo "Copying metadata. $snapshot_metadata -> $snapshot_receive/"
+    cp -a "$snapshot_metadata" "$snapshot_receive/"
+
+    if [[ -v snapshot_parent_number ]]; then
+        [[ -v verbose ]] && echo "Starting incremental send/receive transfer..."
+        btrfs send -p "$snapshot_parent" "$snapshot_send" | pv -s $total_transfer_size -p -e -r -t | btrfs receive "$snapshot_receive"
+    else
+        [[ -v verbose ]] && echo "Starting full send/receive transfer..."
+        btrfs send "$snapshot_send" | pv -s $total_transfer_size -p -e -r -t | btrfs receive "$snapshot_receive"
+    fi
+}
+
+
+ParseArguments() {
+    while(($#)); do
+        case "$1" in
+            --verbose)
+                verbose=true;
+                shift 1
+                ;;
+            --user)
+                if [[ $# < 2 ]]; then
+                    echo "Option '$1' expects user name."
+                    exit 1
+                fi
+
+                user=$2
+                shift 2
+                ;;
+            setup)
+                setup=true
+                commandFound=$(expr $commandFound + 1)
+                shift 1
+                ;;
+            init)
+                commandFound=$(expr $commandFound + 1)
+                initialize=true
+                shift 1
+                ;;
+            mount)
+                if [[ $# > 1 ]]; then
+                    case "$2" in
+                        smb)
+                            commandFound=$(expr $commandFound + 1)
+                            mount_smb=true
+                            ;;
+                        backup)
+                            commandFound=$(expr $commandFound + 1)
+                            mount_backup=true
+                            ;;
+                        *)
+                            echo "Unrecognised mount type."
+                            exit 1
+                    esac
+                    shift 1
+                else
+                    echo "Command $1 needs an argument."
+                    exit 1
+                fi
+                shift 1
+                ;;
+            umount)
+                if [[ $# > 1 ]]; then
+                    case "$2" in
+                        backup)
+                            unmount_backup=true
+                            commandFound=$(expr $commandFound + 1)
+                            ;;
+                        smb)
+                            unmount_smb=true
+                            commandFound=$(expr $commandFound + 1)
+                            ;;
+                        *)
+                            echo "Unrecognised unmount type."
+                            exit 1
+                    esac
+                    shift 1
+                else
+                    echo "Command $1 needs an argument."
+                    exit 1
+                fi
+                shift 1
+                ;;
+            transfer)
+                transfer=true
+                commandFound=$(expr $commandFound + 1)
+
+                shift 1
+                ;;
+            *)
+                echo "Unsupported argument '$1'."
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ ! -v commandFound ]]; then
+        echo "No command found. What should I do?"
+        exit 1
+    fi
+
+    if [[ $commandFound > 1 ]]; then
+        echo "More than one command found. Which should I choose?"
+        exit 1
+    fi
+
+    if [[ -v setup ]]; then
+        CreateTopLevelBackupDirs
+        exit 0
+    fi
+
+    if [[ -v initialize ]]; then
+        if [[ ! -v user ]]; then
+            echo "user option is missing."
+            exit 1
+        fi
+
+        CreateBackupDisk $user
+        exit 0
+    fi
+
+    if [[ -v mount_smb || -v mount_backup ]]; then
+        if [[ -v mount_smb && ! -v user ]]; then
+            echo "No user was specified."
+            exit 1
+        fi
+
+        if [[ ! -v PASSWD ]]; then
+            echo "PASSWD contained no value."
+            exit 1
+        fi
+
+        if [[ -v mount_smb ]]; then
+            MountSambaShare $user
+        else
+            echo "Calling mounting backup disk."
+            MountBackupDisk
+        fi
+    fi
+
+    if [[ -v unmount_backup ]]; then
+        UnmountBackupDisk
+    fi
+
+    if [[ -v unmount_smb ]]; then
+        UnmountBackupDisk
+        if mount | grep "$BACKUP_SMB" >/dev/null; then
+            [[ -v verbose ]] && echo "umount $BACKUP_SMB"
+            umount "$BACKUP_SMB"
+        fi
+    fi
+
+    if [[ -v transfer ]]; then
+        TransferAll
+    fi
+}
+
+ParseArguments $@

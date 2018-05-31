@@ -1,0 +1,600 @@
+#!/bin/bash
+
+
+BACKUP_BIN=/home/gerben/Private/projects/backup
+BACKUP_ROOT=/home/.backup-laptop
+BACKUP_DISK=$BACKUP_ROOT/backup-disk
+BACKUP_SMB=$BACKUP_ROOT/surfsara-disk
+BACKUP_IMAGE=$BACKUP_SMB/backup-disk-image.btrfs
+
+# Determine if a suitable ip route to the backup disk is available.
+SuitableRouteAvailable() {
+    ip_ranges_office="145.100.1.0/24 2001:610:108:2031::/64"
+    ip_ranges_vpn="145.100.19.0/24 2001:610:108:203c::/64 2001:610:108:203d::/64"
+
+    ip_ranges="$ip_ranges_office $ip_ranges_vpn"
+
+    for ip in $ip_ranges; do
+        if [[ -n $(ip route show to root $ip) ]]; then
+            route_available=true
+        fi
+    done
+
+    if [[ -v route_available ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+
+# MountSMBShare() {
+#     local user_name
+#     local user_password
+
+#     if [[ $# -ne 2 ]]; then
+#         echo "MountSMBShare expexts two arguments <user name> <user password>"
+#         exit 1
+#     fi
+
+#     user_name=$1
+#     user_password=$2
+
+#     if [[ ! $(mount | grep $BACKUP_SMB 2>&1 >/dev/null) ]]; then
+#         export PASSWD="$user_password"
+#         sudo ./backup-root-commands $verbose --user "$user_name" mount smb
+#         if [[ $? != 0 ]]; then
+#             echo "Error: could not mount the Samba share."
+#             exit 1
+#         fi
+#     fi
+# }
+
+
+# Mount the backup disk. This involves two mounts:
+#   1 - the Samba mount, which contains a btrfs image, and
+#   2 - mounting the btrfs image found on the Samba share.
+# MountBackupDisk() {
+#     local encryption_password
+
+#     if [[ $# -ne 1 ]]; then
+#         echo "MountBackupDisk expexts one argument <encryption password>"
+#         exit 1
+#     fi
+
+#     encryption_password=$1
+
+#     echo "Mounting backup-disk"
+#     if [[ ! $(mount | grep /home/.backup/backup-disk 2>&1 >/dev/null) ]]; then
+#         sudo "$BACKUP_BIN/mount-backup-disk" "$encryption_password"
+#         if [[ $? != 0 ]]; then
+#             echo "Error: could not mount the backup disk."
+#             exit 1
+#         fi
+#     fi
+# }
+
+
+# Unmount both the backup disk as well as the SURFsara share in case either is mounted.
+# UmountBackupDisk() {
+#     echo "Unmounting"
+
+#     if [[ $(mount | grep /home.backup-laptop/backup-disk 2>&1 >/dev/null) ]]; then
+#         echo "backup-disk"
+#         sudo umount /home/.backup-laptop/backup-disk
+#     fi
+
+#     if [[ $(mount | grep /home.backup-laptop/surfsara-disk 2>&1 >/dev/null) ]]; then
+#         echo "samba-share"
+#         sudo umount /home/.backup-laptop/surfsara-disk
+#     fi
+# }
+
+
+# Determine the folder does not exists for the given wallet.
+KWalletFolderDoesNotExists() {
+
+    rc=$(qdbus org.kde.kwalletd /modules/kwalletd5 org.kde.KWallet.folderDoesNotExist "$wallet" "$folder")
+
+    if [[ "$rc" == "true" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Create a new folder without checking it exists. If it does the call
+# will fail, display an error and exits. Before calling this function,
+# make sure the folder doen not exists.
+CreateKWalletFolder() {
+
+    rc=$(qdbus org.kde.kwalletd /modules/kwalletd5 org.kde.KWallet.createFolder "$handle" "$folder" "$appid")
+
+    if [[ "$rc" == "false" ]]; then
+        echo "Error: The folder '$folder' could not be created."
+        exit 1
+    fi
+
+    return 0
+}
+
+#
+GetKWalletHandle() {
+    handle=$(qdbus org.kde.kwalletd /modules/kwalletd5 org.kde.KWallet.open "$wallet" 0 "$appid")
+}
+
+
+EnsureKWalletFolderExists() {
+    if KWalletFolderDoesNotExists "$wallet" "$folder"; then
+       CreateKWalletFolder $handle "$folder" "$appid"
+    fi
+}
+
+
+# KWalletPasswordEntryExists() {
+#     key=$1
+#     rc=$(qdbus org.kde.kwalletd /modules/kwalletd5 org.kde.KWallet.hasEntry $handle "$folder" "$key" "$appid")
+
+#     echo "hasEntry: $rc"
+
+#     if [[ "$rc" == "false" ]]; then
+#         return 1
+#     fi
+
+#     return 0
+# }
+
+
+GetKWalletPassword() {
+    key="$1"
+
+    rc=$(qdbus org.kde.kwalletd /modules/kwalletd5 org.kde.KWallet.readPassword $handle "$folder" "$key" "$appid")
+
+    echo "$rc"
+}
+
+
+ContinueBackup() {
+    local credentials
+    local cred
+    local user_name
+
+    # trap UmountBackupDisk EXIT
+
+    credentials=$(GetCredentials)
+
+    readarray -t cred <<<"$credentials"
+
+    user_name="${cred[0]}"
+    PASSWD="${cred[1]}"
+
+    export PASSWD
+
+    # We should be able to mount the backup disk.
+    if ! sudo ./backup-root-commands $verbose --user $user_name mount smb; then
+        echo "Error: Failed to mount the backup disk."
+        exit 1
+    fi
+
+    PASSWD=$(GetKey)
+    if ! sudo ./backup-root-commands $verbose mount backup; then
+        echo "Error: Failed to mount the backup disk."
+        exit 1
+    fi
+
+    sudo ./backup-root-commands $verbode continue
+
+    sudo ./backup-root-commands $verbose unmount backup
+}
+
+
+GetEntryData() {
+    local json_data
+
+    if KWalletFolderDoesNotExists; then
+        return
+    fi
+
+    json_data=$(kwallet-query --folder "$folder" --read-password "$entry" "$wallet")
+
+    echo "$json_data"
+}
+
+
+SetEntryData() {
+    if [[ $# -eq 1 ]]; then
+        echo "$1" | kwallet-query --folder "$folder" --write-password "$entry" "$wallet"
+    fi
+}
+
+
+
+GetKey() {
+    local json_data
+
+    json_data=$(GetEntryData)
+
+    if [[ "$json_data" != "" ]]; then
+        local password
+
+        password=$(echo "$json_data" | jq -r .encryption_password)
+        echo "$password"
+    fi
+}
+
+
+GetCredentials() {
+    local json_data
+
+    json_data=$(GetEntryData)
+
+    if [[ "$json_data" != "" ]]; then
+        local credentials
+
+        credentials=$(echo "$json_data" | jq -r '.user_name, .user_password')
+
+        IFS=$'\n'
+        let c=0
+        for i in $credentials; do
+            if [[ $i != "null" ]]; then
+                let c=c+1
+            fi
+        done
+
+        if [[ $c -eq 2 ]]; then
+            echo "$credentials"
+        fi
+    fi
+}
+
+
+GenerateKey() {
+    local credentials
+    local key
+
+    EnsureKWalletFolderExists
+
+    key=$(dd bs=512 count=4 if=/dev/urandom iflag=fullblock 2>/dev/null | base64)
+    credentials=$(GetCredentials)
+
+    if [[ $credentials != "" ]]; then
+        local json_data
+        local cred
+
+        readarray -t cred <<<"$credentials"
+
+        user_name="${cred[0]}"
+        user_password="${cred[1]}"
+
+        json_data="{ \"key\": \"$key\", \"user_name\": \"$user_name\", \"user_password\": \"$user_password\" }"
+        SetEntryData "$json_data"
+    fi
+}
+
+
+SetCredentials() {
+    cat <<EOM
+You are about to set the credentials that are needed for mounting the SMB
+share, on which an encrypted backup will be kept. If you do not specify a value
+for either the user name or the passwords, the setting of the credentials will
+be skipped.
+
+EOM
+
+    local user_name
+    local password
+    local password_again
+    local key
+    local json_data
+
+    EnsureKWalletFolderExists
+
+    echo -n "user name: "
+    read user_name
+
+    if [[ "$user_name" == "" ]]; then
+        echo "Empty user name. Credentials are not set."
+        return
+    fi
+
+    while true; do
+        echo -n "password: "
+        read -s password
+        if [[ "$password" == "" ]]; then
+            echo
+            echo "Empty password. Credentials are not set."
+            return;
+        fi
+        echo
+        echo -n "retype password: "
+        read -s passwd_again
+        echo
+
+        if [[ "$password" != "$passwd_again" ]]; then
+            echo
+            echo "Passwords did not match, please retype them again."
+            continue
+        fi
+
+        break
+    done
+
+    key=$(GetKey)
+
+    if [[ "$key" == "" ]]; then
+        json_data="{ \"user_name\": \"$user_name\", \"user_password\": \"$password\" }"
+    else
+        json_data="{ \"key\": \"$key\", \"user_name\": \"$user_name\", \"user_password\": \"$password\" }"
+    fi
+
+    SetEntryData "$json_data"
+}
+
+
+SMBNotMounted() {
+    if mount -l -t cifs | fgrep $BACKUP_SMB 2>&1 >/dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+
+InitializeBackupDisk() {
+    local user_name
+    local user_password
+    local key
+    local credentials
+
+    if ! SuitableRouteAvailable; then
+        echo "Make sure you are connected to either the internal network at SURFsara or the VPN."
+        echo "Aborting..."
+        exit 1
+    fi
+
+    sudo ./backup-root-commands setup
+
+    key=$(GetKey)
+    credentials=$(GetCredentials)
+    if [[ $credentials != "" ]]; then
+
+        readarray -t cred <<<"$credentials"
+
+        user_name="${cred[0]}"
+        user_password="${cred[1]}"
+    fi
+
+    if SMBNotMounted; then
+        export PASSWD="$user_password"
+        sudo ./backup-root-commands $verbose --user "$user_name" mount smb
+    fi
+
+    export PASSWD="$key"
+    CreateBackupDisk "$user_name"
+    [[ -v verbose ]] && echo "Backup disk has been created."
+
+    if ! sudo ./backup-root-commands $verbose --user "$user_name" mount backup; then
+        echo "Error: Failed to mount the backup disk."
+        exit 1
+    fi
+
+    sudo ./backup-root-commands $verbose transfer
+
+    sudo ./backup-root-commands unount backup
+    sudo ./backup-root-commands umount smb
+}
+
+
+CreateBackupDisk() {
+    local user_name
+
+    if [[ $# -ne 1 ]]; then
+        echo "Expecting <user name>."
+        exit 1
+    fi
+
+    user_name=$1
+
+    if SMBNotMounted; then
+        echo "Mount samba share first."
+        exit 1
+    fi
+
+    if [[ -e $BACKUP_IMAGE ]]; then
+        local ans
+
+        echo "Old backup disk found. If you continue this disk will be ereased."
+        echo -n "Do you want to continue (y/N)? "
+        read ans
+
+        case $ans in
+            y | Y | yes | YES)
+                ;;
+            *)
+                exit 1
+        esac
+
+        rm $BACKUP_IMAGE
+    fi
+
+    local free_space
+    free_space=$(df --block-size 1 $BACKUP_SMB | tail -1 | awk '{ print $2 }')
+
+    [[ -v verbose ]] && echo "Creating a $(numfmt --to=iec $free_space) sparse file at: $BACKUP_IMAGE."
+    truncate -s $free_space $BACKUP_IMAGE
+
+    export PASSWD=$(GetKey)
+
+    sudo ./backup-root-commands $verbose --user "$user_name" init
+}
+
+MountOnly() {
+    local key
+    local credentials
+    local user_name
+    local user_password
+
+    key=$(GetKey)
+    credentials=$(GetCredentials)
+    if [[ $credentials != "" ]]; then
+
+        readarray -t cred <<<"$credentials"
+
+        user_name="${cred[0]}"
+        user_password="${cred[1]}"
+    fi
+
+    [[ -v verbose ]] && echo "Mounting smb."
+    export PASSWD="$user_password"
+    sudo ./backup-root-commands $verbose --user "$user_name" mount smb
+
+    [[ -v verbose ]] && echo "Mounting backup disk."
+    export PASSWD="$key"
+    sudo ./backup-root-commands $verbose mount backup
+}
+
+
+UmountOnly() {
+    sudo ./backup-root-commands $verbose umount smb
+}
+
+
+ShowDefaultValues() {
+    echo "Default values:"
+    echo "  Wallet name:  $wallet"
+    echo "  Folder:       $folder"
+}
+
+
+ShowHelp() {
+    echo "Usage: $1 <options> <command>"
+    cat <<EOM
+  -h, --help         Show this help.
+  --show-defaults    Show default values.
+  --set-credentials
+                     Set the credentials needed for mounting the SMB share.
+  --generate-key
+                     Set the password needed for encrypting the backup data.
+  --folder           Specify the folder in the wallet
+Commands:
+  init               Initialize backup.
+  start              Start the backup.
+EOM
+}
+
+
+ParseArguments() {
+    local commandFound
+
+    while(( $# )); do
+        case "$1" in
+            -h | --help)
+                ShowHelp
+                exit 0
+                ;;
+            --show-defaults)
+                ShowDefaultValues
+                exit 0
+                ;;
+            --verbose)
+                verbose="--verbose"
+                shift 1
+                ;;
+            --set-credentials)
+                setCredentials=true
+                shift 1
+                ;;
+            --generate-key)
+                generateKey=true
+                shift 1
+                ;;
+            --folder)
+                if [[ $# -lt 2 ]] || [[ $2 == -* ]]; then
+                    echo "'$1' needs a value. See --help for more info."
+                    exit 1
+                fi
+                folder="$2"
+                shift 2
+                ;;
+            -*|--*)
+                echo "Unsupported option: '$1'. See --help for more info."
+                exit 1
+                ;;
+            init)
+                commandFound=$(expr $commandFound + 1)
+                initializeBackupDisk=true
+                shift 1
+                ;;
+            continue)
+                commandFound=$(expr $commandFound + 1)
+                startBackup=true
+                shift 1
+                ;;
+            mount)
+                commandFound=$(expr $commandFound + 1)
+                mountOnly=true
+                shift 1
+                ;;
+            umount)
+                commandFound=$(expr $commandFound + 1)
+                umountOnly=true
+                shift 1
+                ;;
+            *)
+                echo "Unsupported argument: '$1'. See --help for more info."
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ $commandFound > 1 ]]; then
+        echo "Multiple commands found. Which should I choose?"
+        exit 1
+    fi
+
+    GetKWalletHandle
+
+    if [[ -v setCredentials ]]; then
+        SetCredentials
+    fi
+
+    if [[ -v generateKey ]]; then
+        GenerateKey
+    fi
+
+    # From this point onward, utimately we will try to mount the samba share,
+    # or backup disk. This means that we need to be connected to the internal
+    # network.
+    # Make sure a route to the backup disk is available.
+    if ! SuitableRouteAvailable; then
+        cat <<-EOM
+			No IP route to the backup disk can be found. This can be either:
+			  1 - not being connected to the internal SURFsara wired network, or
+			  2 - not being connected to the SURFsara VPN.
+EOM
+    exit 1
+    fi
+
+    if [[ -v mountOnly ]]; then
+        MountOnly
+    fi
+
+    if [[ -v umountOnly ]]; then
+        UmountOnly
+    fi
+    if [[ -v initializeBackupDisk ]]; then
+        InitializeBackupDisk
+    fi
+
+    if [[ -v startBackup ]]; then
+        ContinueBackup
+    fi
+}
+
+
+wallet="kdewallet"
+folder="SURFsara"
+appid="SURFsara Backup"
+entry="gerben"
+
+ParseArguments $@
